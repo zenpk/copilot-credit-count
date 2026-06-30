@@ -15,6 +15,11 @@ export interface Summary {
   totalCredits: number;
 }
 
+export interface SyncMeta {
+  synced: boolean;
+  lastSyncTime: string;
+}
+
 export class CreditsStorage {
   private readonly storageDir: string;
   private readonly seenIds = new Map<string, { month: string; credits: number }>();
@@ -145,9 +150,7 @@ export class CreditsStorage {
     return [...models].sort();
   }
 
-  getCurrentMonthFilePath(): string {
-    const now = new Date();
-    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  getMonthFilePath(month: string): string {
     const filePath = this.fileForMonth(month);
     if (!fs.existsSync(filePath)) {
       this.writeFile(filePath, []);
@@ -163,5 +166,24 @@ export class CreditsStorage {
       }),
       { count: 0, totalCredits: 0 },
     );
+  }
+
+  // --- sync meta ---
+
+  private syncMetaPath(): string {
+    return path.join(this.storageDir, 'sync-meta.json');
+  }
+
+  loadSyncMeta(): SyncMeta {
+    try {
+      const raw = fs.readFileSync(this.syncMetaPath(), 'utf-8');
+      return JSON.parse(raw) as SyncMeta;
+    } catch {
+      return { synced: false, lastSyncTime: '' };
+    }
+  }
+
+  saveSyncMeta(meta: SyncMeta): void {
+    fs.writeFileSync(this.syncMetaPath(), JSON.stringify(meta, null, 2), 'utf-8');
   }
 }

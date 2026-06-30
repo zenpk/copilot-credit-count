@@ -46,10 +46,19 @@ export class CopilotCreditsWatcher extends EventEmitter {
     this.workspaceStorageDir = workspaceStorageDir;
   }
 
-  start(): void {
+  /**
+   * @param skipBackfill When true, fast-forwards all existing files to the end
+   * and only captures new data going forward. When false, reads all files from
+   * the beginning (full scan).
+   */
+  start(skipBackfill: boolean): void {
     if (!fs.existsSync(this.workspaceStorageDir)) return;
 
-    this.scanAllFiles();
+    if (skipBackfill) {
+      this.fastForwardAllFiles();
+    } else {
+      this.scanAllFiles();
+    }
 
     const top = fs.watch(
       this.workspaceStorageDir,
@@ -71,10 +80,35 @@ export class CopilotCreditsWatcher extends EventEmitter {
     for (const w of this.fileWatchers.values()) w.close();
     this.dirWatchers.length = 0;
     this.fileWatchers.clear();
+    this.filePositions.clear();
+    this.requestMetaByFile.clear();
     this.pendingCreditsByFile.clear();
     this.sessionTitleByFile.clear();
+    this.trackedChatDirs.clear();
   }
 
+  /** Skip reading existing content — just set position to end and attach watchers. */
+  private fastForwardAllFiles(): void {
+    for (const entry of fs.readdirSync(this.workspaceStorageDir)) {
+      const workspaceDir = path.join(this.workspaceStorageDir, entry);
+      if (!this.isDirectory(workspaceDir)) continue;
+      const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
+      if (!this.isDirectory(chatSessionsDir)) continue;
+
+      this.trackedChatDirs.add(chatSessionsDir);
+
+      for (const file of fs.readdirSync(chatSessionsDir)) {
+        if (!file.endsWith('.jsonl')) continue;
+        const filePath = path.join(chatSessionsDir, file);
+        try {
+          this.filePositions.set(filePath, fs.statSync(filePath).size);
+        } catch { /* ignore */ }
+        this.watchFile(filePath);
+      }
+    }
+  }
+
+  /** Read all files from the beginning (full scan). */
   private scanAllFiles(): void {
     for (const entry of fs.readdirSync(this.workspaceStorageDir)) {
       const workspaceDir = path.join(this.workspaceStorageDir, entry);
@@ -196,6 +230,11 @@ export class CopilotCreditsWatcher extends EventEmitter {
         };
         requestMeta.set(i, meta);
 
+        const embeddedCredits = this.extractCreditsFromRequest(requests[i]);
+        if (embeddedCredits !== undefined && meta.requestId) {
+          this.emitUsage(meta, embeddedCredits);
+        }
+
         const pending = pendingCredits.get(i);
         if (pending !== undefined && meta.requestId) {
           this.emitUsage(meta, pending);
@@ -236,6 +275,11 @@ export class CopilotCreditsWatcher extends EventEmitter {
       };
       requestMeta.set(index, meta);
 
+      const embeddedCredits = this.extractCreditsFromRequest(obj.v[0]);
+      if (embeddedCredits !== undefined && meta.requestId) {
+        this.emitUsage(meta, embeddedCredits);
+      }
+
       const pending = pendingCredits.get(index);
       if (pending !== undefined && meta.requestId) {
         this.emitUsage(meta, pending);
@@ -267,7 +311,6 @@ export class CopilotCreditsWatcher extends EventEmitter {
         return;
       }
 
-      // Model can be a string or an object like { id: "gpt-4o", ... }
       if (key.length === 3 && MODEL_FIELDS.has(field as string)) {
         const model = this.extractModelValue(obj.v);
         if (model) {
@@ -277,7 +320,6 @@ export class CopilotCreditsWatcher extends EventEmitter {
         return;
       }
 
-      // Extract model from result/response sub-objects
       if (key.length === 3 && (field === 'result' || field === 'response') && typeof obj.v === 'object' && obj.v !== null) {
         const nested = obj.v as Record<string, unknown>;
         const model = this.extractModelValue(nested.model) ?? this.extractModelValue(nested.modelName);
@@ -287,10 +329,18 @@ export class CopilotCreditsWatcher extends EventEmitter {
             requestMeta.set(index, { ...current, model });
           }
         }
+        const credits = typeof nested.copilotCredits === 'number' ? nested.copilotCredits : undefined;
+        if (credits !== undefined && credits > 0) {
+          const meta = requestMeta.get(index);
+          if (meta?.requestId) {
+            this.emitUsage(meta, credits);
+          } else {
+            pendingCredits.set(index, credits);
+          }
+        }
         return;
       }
 
-      // Handle deeper paths: requests[i].result.model, requests[i].response.model, etc.
       if (key.length === 4 && (field === 'result' || field === 'response')) {
         const subField = key[3];
         if (MODEL_FIELDS.has(subField as string) || subField === 'modelName') {
@@ -300,6 +350,14 @@ export class CopilotCreditsWatcher extends EventEmitter {
             if (!current.model) {
               requestMeta.set(index, { ...current, model });
             }
+          }
+        }
+        if (subField === 'copilotCredits' && typeof obj.v === 'number' && obj.v > 0) {
+          const meta = requestMeta.get(index);
+          if (meta?.requestId) {
+            this.emitUsage(meta, obj.v);
+          } else {
+            pendingCredits.set(index, obj.v);
           }
         }
         return;
@@ -314,6 +372,27 @@ export class CopilotCreditsWatcher extends EventEmitter {
         requestMeta.set(index, { ...current, context });
       }
     }
+  }
+
+  private extractCreditsFromRequest(req: unknown): number | undefined {
+    if (!req || typeof req !== 'object') return undefined;
+    const obj = req as Record<string, unknown>;
+
+    if (typeof obj.copilotCredits === 'number' && obj.copilotCredits > 0) {
+      return obj.copilotCredits;
+    }
+
+    for (const key of ['result', 'response']) {
+      const nested = obj[key];
+      if (nested && typeof nested === 'object') {
+        const n = nested as Record<string, unknown>;
+        if (typeof n.copilotCredits === 'number' && n.copilotCredits > 0) {
+          return n.copilotCredits;
+        }
+      }
+    }
+
+    return undefined;
   }
 
   private extractModelValue(v: unknown): string | undefined {
@@ -356,7 +435,6 @@ export class CopilotCreditsWatcher extends EventEmitter {
       ?? this.extractModelValue(obj.modelId)
       ?? this.extractModelValue(obj.selectedModelId);
 
-    // Check nested result/response objects for model info
     if (!model && obj.result && typeof obj.result === 'object') {
       const result = obj.result as Record<string, unknown>;
       model = this.extractModelValue(result.model) ?? this.extractModelValue(result.modelName);

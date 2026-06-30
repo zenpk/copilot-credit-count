@@ -36,11 +36,13 @@ export function refreshDashboard(storage: CreditsStorage): void {
 }
 
 function sendData(p: vscode.WebviewPanel, storage: CreditsStorage): void {
+  const syncMeta = storage.loadSyncMeta();
   p.webview.postMessage({
     type: 'data',
     entries: storage.getAll(),
     months: storage.getAvailableMonths(),
     models: storage.getAvailableModels(),
+    lastSyncTime: syncMeta.lastSyncTime,
   });
 }
 
@@ -85,6 +87,12 @@ function getHtml(webview: vscode.Webview): string {
       gap: 8px;
     }
     h1 .icon { opacity: 0.7; }
+
+    .sync-info {
+      font-size: 0.82em;
+      opacity: 0.45;
+      margin: -12px 0 16px;
+    }
 
     .summary-row {
       display: flex;
@@ -237,6 +245,7 @@ function getHtml(webview: vscode.Webview): string {
 </head>
 <body>
   <h1><span class="icon">&#9889;</span> Copilot Credit Count</h1>
+  <div class="sync-info" id="sync-info"></div>
 
   <div class="summary-row">
     <div class="summary-card">
@@ -316,6 +325,10 @@ function getHtml(webview: vscode.Webview): string {
         allModels = msg.models || [];
         populateFilters();
         render();
+        const syncEl = document.getElementById('sync-info');
+        if (msg.lastSyncTime) {
+          syncEl.textContent = 'Last synced: ' + formatDate(msg.lastSyncTime);
+        }
       }
     });
 

@@ -2,7 +2,7 @@
   "name": "copilot-credit-count",
   "displayName": "Copilot Credit Count",
   "description": "Track and visualize your GitHub Copilot credit usage across models with an interactive dashboard.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "zenpk",
   "author": {
     "name": "zenpk"
@@ -38,6 +38,10 @@
       {
         "command": "copilot-credit-count.openStorageFile",
         "title": "Copilot Credit Count: Open Storage File"
+      },
+      {
+        "command": "copilot-credit-count.resync",
+        "title": "Copilot Credit Count: Resync All Sessions"
       }
     ]
   },
