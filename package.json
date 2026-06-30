@@ -2,7 +2,7 @@
   "name": "copilot-credit-count",
   "displayName": "Copilot Credit Count",
   "description": "Track and visualize your GitHub Copilot credit usage across models with an interactive dashboard.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "zenpk",
   "author": {
     "name": "zenpk"
@@ -32,8 +32,12 @@
   "contributes": {
     "commands": [
       {
-        "command": "copilotCredits.showDashboard",
-        "title": "Copilot Credits: Show Dashboard"
+        "command": "copilot-credit-count.showDashboard",
+        "title": "Copilot Credit Count: Show Dashboard"
+      },
+      {
+        "command": "copilot-credit-count.openStorageFile",
+        "title": "Copilot Credit Count: Open Storage File"
       }
     ]
   },

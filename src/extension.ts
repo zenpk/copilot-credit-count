@@ -1,7 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { showDashboard, refreshDashboard } from './dashboard';
-import type { CreditEntry } from './storage';
 import { CreditsStorage } from './storage';
 import type { UsageEvent } from './watcher';
 import { CopilotCreditsWatcher } from './watcher';
@@ -11,16 +10,16 @@ let watcher: CopilotCreditsWatcher;
 let statusBar: vscode.StatusBarItem;
 
 export function activate(context: vscode.ExtensionContext) {
-  const storageDir = path.join(context.globalStorageUri.fsPath, '..', '..', '..', 'copilot-credit-count');
+  const storageDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..', '..', 'copilot-credit-count').fsPath;
   storage = new CreditsStorage(storageDir);
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = 'copilotCredits.showDashboard';
+  statusBar.command = 'copilot-credit-count.showDashboard';
   statusBar.tooltip = 'Copilot Credits — click to open dashboard';
   updateStatusBar();
   statusBar.show();
 
-  const userDir = path.resolve(context.globalStorageUri.fsPath, '..', '..');
+  const userDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..').fsPath;
   const workspaceStorageDir = path.join(userDir, 'workspaceStorage');
 
   watcher = new CopilotCreditsWatcher(workspaceStorageDir);
@@ -34,7 +33,14 @@ export function activate(context: vscode.ExtensionContext) {
   watcher.start();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('copilotCredits.showDashboard', () => showDashboard(context, storage)),
+    vscode.commands.registerCommand('copilot-credit-count.showDashboard', () =>
+      showDashboard(context, storage),
+    ),
+    vscode.commands.registerCommand('copilot-credit-count.openStorageFile', async () => {
+      const filePath = storage.getCurrentMonthFilePath();
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+      await vscode.window.showTextDocument(doc, { preview: false });
+    }),
     statusBar,
     { dispose: () => watcher.stop() },
   );

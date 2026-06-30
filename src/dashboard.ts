@@ -11,7 +11,7 @@ export function showDashboard(context: vscode.ExtensionContext, storage: Credits
   }
 
   panel = vscode.window.createWebviewPanel(
-    'copilotCredits.dashboard',
+    'copilot-credit-count.dashboard',
     'Copilot Credit Count',
     vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: true },

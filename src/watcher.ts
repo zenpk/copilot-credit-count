@@ -23,6 +23,14 @@ interface RequestMeta {
   context?: string;
 }
 
+const MODEL_FIELDS = new Set([
+  'model',
+  'modelSlug',
+  'modelId',
+  'chatModelId',
+  'selectedModelId',
+]);
+
 export class CopilotCreditsWatcher extends EventEmitter {
   private readonly workspaceStorageDir: string;
   private readonly filePositions = new Map<string, number>();
@@ -237,10 +245,10 @@ export class CopilotCreditsWatcher extends EventEmitter {
     }
 
     // Capture field-level deltas on individual request properties.
-    if (kind === 1 && key.length === 3) {
+    if (kind === 1 && key.length >= 3) {
       const field = key[2];
 
-      if (field === 'requestId' && typeof obj.v === 'string') {
+      if (field === 'requestId' && key.length === 3 && typeof obj.v === 'string') {
         const current = requestMeta.get(index) ?? {};
         const meta: RequestMeta = { ...current, requestId: obj.v };
         requestMeta.set(index, meta);
@@ -253,19 +261,51 @@ export class CopilotCreditsWatcher extends EventEmitter {
         return;
       }
 
-      if (field === 'timestamp' && typeof obj.v === 'number') {
+      if (field === 'timestamp' && key.length === 3 && typeof obj.v === 'number') {
         const current = requestMeta.get(index) ?? {};
         requestMeta.set(index, { ...current, timestamp: obj.v });
         return;
       }
 
-      if ((field === 'model' || field === 'modelSlug') && typeof obj.v === 'string') {
-        const current = requestMeta.get(index) ?? {};
-        requestMeta.set(index, { ...current, model: obj.v });
+      // Model can be a string or an object like { id: "gpt-4o", ... }
+      if (key.length === 3 && MODEL_FIELDS.has(field as string)) {
+        const model = this.extractModelValue(obj.v);
+        if (model) {
+          const current = requestMeta.get(index) ?? {};
+          requestMeta.set(index, { ...current, model });
+        }
         return;
       }
 
-      if (field === 'message' && typeof obj.v === 'object' && obj.v !== null) {
+      // Extract model from result/response sub-objects
+      if (key.length === 3 && (field === 'result' || field === 'response') && typeof obj.v === 'object' && obj.v !== null) {
+        const nested = obj.v as Record<string, unknown>;
+        const model = this.extractModelValue(nested.model) ?? this.extractModelValue(nested.modelName);
+        if (model) {
+          const current = requestMeta.get(index) ?? {};
+          if (!current.model) {
+            requestMeta.set(index, { ...current, model });
+          }
+        }
+        return;
+      }
+
+      // Handle deeper paths: requests[i].result.model, requests[i].response.model, etc.
+      if (key.length === 4 && (field === 'result' || field === 'response')) {
+        const subField = key[3];
+        if (MODEL_FIELDS.has(subField as string) || subField === 'modelName') {
+          const model = this.extractModelValue(obj.v);
+          if (model) {
+            const current = requestMeta.get(index) ?? {};
+            if (!current.model) {
+              requestMeta.set(index, { ...current, model });
+            }
+          }
+        }
+        return;
+      }
+
+      if (field === 'message' && key.length === 3 && typeof obj.v === 'object' && obj.v !== null) {
         const current = requestMeta.get(index) ?? {};
         const messageText = (obj.v as { text?: unknown }).text;
         if (typeof messageText !== 'string') return;
@@ -274,6 +314,19 @@ export class CopilotCreditsWatcher extends EventEmitter {
         requestMeta.set(index, { ...current, context });
       }
     }
+  }
+
+  private extractModelValue(v: unknown): string | undefined {
+    if (typeof v === 'string' && v.length > 0) return v;
+    if (v && typeof v === 'object') {
+      const obj = v as Record<string, unknown>;
+      for (const key of ['id', 'name', 'modelId', 'slug']) {
+        if (typeof obj[key] === 'string' && (obj[key] as string).length > 0) {
+          return obj[key] as string;
+        }
+      }
+    }
+    return undefined;
   }
 
   private emitUsage(meta: RequestMeta, credits: number): void {
@@ -291,20 +344,28 @@ export class CopilotCreditsWatcher extends EventEmitter {
 
   private extractMetaFromRequest(filePath: string, req: unknown): RequestMeta {
     if (!req || typeof req !== 'object') return {};
-    const obj = req as {
-      requestId?: unknown;
-      timestamp?: unknown;
-      message?: { text?: unknown };
-      model?: unknown;
-      modelSlug?: unknown;
-    };
-    const messageText = typeof obj.message?.text === 'string' ? obj.message.text : undefined;
-    const model =
-      typeof obj.model === 'string'
-        ? obj.model
-        : typeof obj.modelSlug === 'string'
-          ? obj.modelSlug
-          : undefined;
+    const obj = req as Record<string, unknown>;
+    const messageText =
+      typeof (obj.message as { text?: unknown })?.text === 'string'
+        ? ((obj.message as { text: string }).text)
+        : undefined;
+
+    let model = this.extractModelValue(obj.model)
+      ?? this.extractModelValue(obj.modelSlug)
+      ?? this.extractModelValue(obj.chatModelId)
+      ?? this.extractModelValue(obj.modelId)
+      ?? this.extractModelValue(obj.selectedModelId);
+
+    // Check nested result/response objects for model info
+    if (!model && obj.result && typeof obj.result === 'object') {
+      const result = obj.result as Record<string, unknown>;
+      model = this.extractModelValue(result.model) ?? this.extractModelValue(result.modelName);
+    }
+    if (!model && obj.response && typeof obj.response === 'object') {
+      const response = obj.response as Record<string, unknown>;
+      model = this.extractModelValue(response.model) ?? this.extractModelValue(response.modelName);
+    }
+
     return {
       requestId: typeof obj.requestId === 'string' ? obj.requestId : undefined,
       timestamp: typeof obj.timestamp === 'number' ? obj.timestamp : undefined,
