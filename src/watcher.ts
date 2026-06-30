@@ -32,7 +32,7 @@ const MODEL_FIELDS = new Set([
 ]);
 
 export class CopilotCreditsWatcher extends EventEmitter {
-  private readonly workspaceStorageDir: string;
+  private readonly scanDirs: string[];
   private readonly filePositions = new Map<string, number>();
   private readonly trackedChatDirs = new Set<string>();
   private readonly requestMetaByFile = new Map<string, Map<number, RequestMeta>>();
@@ -41,9 +41,9 @@ export class CopilotCreditsWatcher extends EventEmitter {
   private readonly dirWatchers: fs.FSWatcher[] = [];
   private readonly fileWatchers = new Map<string, fs.FSWatcher>();
 
-  constructor(workspaceStorageDir: string) {
+  constructor(scanDirs: string[]) {
     super();
-    this.workspaceStorageDir = workspaceStorageDir;
+    this.scanDirs = scanDirs;
   }
 
   /**
@@ -52,27 +52,70 @@ export class CopilotCreditsWatcher extends EventEmitter {
    * the beginning (full scan).
    */
   start(skipBackfill: boolean): void {
-    if (!fs.existsSync(this.workspaceStorageDir)) return;
+    for (const dir of this.scanDirs) {
+      if (fs.existsSync(dir)) {
+        this.startDir(dir, skipBackfill);
+      }
+    }
+  }
 
-    if (skipBackfill) {
-      this.fastForwardAllFiles();
-    } else {
-      this.scanAllFiles();
+  private startDir(baseDir: string, skipBackfill: boolean): void {
+    const chatDirs = this.discoverChatDirs(baseDir);
+
+    for (const chatDir of chatDirs) {
+      this.trackChatDir(chatDir, skipBackfill);
     }
 
-    const top = fs.watch(
-      this.workspaceStorageDir,
-      { recursive: false, encoding: 'utf8' },
-      (_event: fs.WatchEventType, filename: string | null) => {
-        if (!filename) return;
-        this.watchWorkspaceDir(path.join(this.workspaceStorageDir, filename));
-      },
-    );
-    this.dirWatchers.push(top);
+    // If baseDir itself is a chatSessions-style dir, watch it for new files directly
+    if (chatDirs.includes(baseDir)) return;
 
-    for (const entry of fs.readdirSync(this.workspaceStorageDir)) {
-      this.watchWorkspaceDir(path.join(this.workspaceStorageDir, entry));
+    // Otherwise watch for new workspace subdirectories appearing
+    try {
+      const top = fs.watch(
+        baseDir,
+        { recursive: false, encoding: 'utf8' },
+        (_event: fs.WatchEventType, filename: string | null) => {
+          if (!filename) return;
+          this.onNewSubdir(path.join(baseDir, filename));
+        },
+      );
+      this.dirWatchers.push(top);
+    } catch { /* dir may not be watchable */ }
+
+    for (const entry of fs.readdirSync(baseDir)) {
+      this.onNewSubdir(path.join(baseDir, entry));
     }
+  }
+
+  private trackChatDir(chatDir: string, skipBackfill: boolean): void {
+    if (this.trackedChatDirs.has(chatDir)) return;
+    this.trackedChatDirs.add(chatDir);
+
+    const files = this.listSessionFiles(chatDir);
+    for (const filePath of files) {
+      if (skipBackfill) {
+        try { this.filePositions.set(filePath, fs.statSync(filePath).size); } catch { /* ignore */ }
+      }
+      this.watchFile(filePath);
+      if (!skipBackfill) {
+        this.processFile(filePath);
+      }
+    }
+
+    try {
+      const watcher = fs.watch(
+        chatDir,
+        { recursive: false, encoding: 'utf8' },
+        (_event: fs.WatchEventType, filename: string | null) => {
+          if (!filename) return;
+          if (!filename.endsWith('.jsonl') && !filename.endsWith('.json')) return;
+          const filePath = path.join(chatDir, filename);
+          this.watchFile(filePath);
+          this.processFile(filePath);
+        },
+      );
+      this.dirWatchers.push(watcher);
+    } catch { /* ignore */ }
   }
 
   stop(): void {
@@ -87,70 +130,46 @@ export class CopilotCreditsWatcher extends EventEmitter {
     this.trackedChatDirs.clear();
   }
 
-  /** Skip reading existing content — just set position to end and attach watchers. */
-  private fastForwardAllFiles(): void {
-    for (const entry of fs.readdirSync(this.workspaceStorageDir)) {
-      const workspaceDir = path.join(this.workspaceStorageDir, entry);
-      if (!this.isDirectory(workspaceDir)) continue;
-      const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
-      if (!this.isDirectory(chatSessionsDir)) continue;
+  /** Find all chatSessions directories under a base directory. */
+  private discoverChatDirs(baseDir: string): string[] {
+    const result: string[] = [];
 
-      this.trackedChatDirs.add(chatSessionsDir);
+    // baseDir itself might be a chatSessions dir (e.g. emptyWindowChatSessions)
+    if (path.basename(baseDir).toLowerCase().includes('chatsessions')) {
+      if (this.isDirectory(baseDir)) result.push(baseDir);
+      return result;
+    }
 
-      for (const file of fs.readdirSync(chatSessionsDir)) {
-        if (!file.endsWith('.jsonl')) continue;
-        const filePath = path.join(chatSessionsDir, file);
-        try {
-          this.filePositions.set(filePath, fs.statSync(filePath).size);
-        } catch { /* ignore */ }
-        this.watchFile(filePath);
+    // Scan subdirectories for chatSessions folders
+    try {
+      for (const entry of fs.readdirSync(baseDir)) {
+        const chatDir = path.join(baseDir, entry, 'chatSessions');
+        if (this.isDirectory(chatDir)) {
+          result.push(chatDir);
+        }
       }
+    } catch { /* ignore */ }
+
+    return result;
+  }
+
+  /** List both .jsonl and .json session files in a directory. */
+  private listSessionFiles(dir: string): string[] {
+    try {
+      return fs.readdirSync(dir)
+        .filter(f => f.endsWith('.jsonl') || f.endsWith('.json'))
+        .map(f => path.join(dir, f));
+    } catch {
+      return [];
     }
   }
 
-  /** Read all files from the beginning (full scan). */
-  private scanAllFiles(): void {
-    for (const entry of fs.readdirSync(this.workspaceStorageDir)) {
-      const workspaceDir = path.join(this.workspaceStorageDir, entry);
-      if (!this.isDirectory(workspaceDir)) continue;
-      const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
-      if (!this.isDirectory(chatSessionsDir)) continue;
-
-      this.trackedChatDirs.add(chatSessionsDir);
-
-      for (const file of fs.readdirSync(chatSessionsDir)) {
-        if (!file.endsWith('.jsonl')) continue;
-        const filePath = path.join(chatSessionsDir, file);
-        this.watchFile(filePath);
-        this.processFile(filePath);
-      }
-    }
-  }
-
-  private watchWorkspaceDir(workspaceDir: string): void {
+  /** Called when a new subdirectory appears in a watched base dir. */
+  private onNewSubdir(workspaceDir: string): void {
     if (!this.isDirectory(workspaceDir)) return;
     const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
     if (!this.isDirectory(chatSessionsDir)) return;
-
-    if (this.trackedChatDirs.has(chatSessionsDir)) return;
-    this.trackedChatDirs.add(chatSessionsDir);
-
-    for (const file of fs.readdirSync(chatSessionsDir)) {
-      if (!file.endsWith('.jsonl')) continue;
-      this.watchFile(path.join(chatSessionsDir, file));
-    }
-
-    const watcher = fs.watch(
-      chatSessionsDir,
-      { recursive: false, encoding: 'utf8' },
-      (_event: fs.WatchEventType, filename: string | null) => {
-        if (!filename?.endsWith('.jsonl')) return;
-        const filePath = path.join(chatSessionsDir, filename);
-        this.watchFile(filePath);
-        this.processFile(filePath);
-      },
-    );
-    this.dirWatchers.push(watcher);
+    this.trackChatDir(chatSessionsDir, false);
   }
 
   private isDirectory(dirPath: string): boolean {
@@ -173,6 +192,11 @@ export class CopilotCreditsWatcher extends EventEmitter {
 
   private processFile(filePath: string): void {
     try {
+      if (filePath.endsWith('.json')) {
+        this.processJsonFile(filePath);
+        return;
+      }
+
       const stat = fs.statSync(filePath);
       const lastPos = this.filePositions.get(filePath) ?? 0;
       if (stat.size <= lastPos) return;
@@ -195,11 +219,56 @@ export class CopilotCreditsWatcher extends EventEmitter {
     }
   }
 
+  /** Handle legacy .json session files (single JSON object with requests array). */
+  private processJsonFile(filePath: string): void {
+    if (this.filePositions.has(filePath)) return;
+    this.filePositions.set(filePath, 1);
+
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const session = JSON.parse(content);
+      if (!session || typeof session !== 'object') return;
+      this.extractFromSessionObject(filePath, session);
+    } catch { /* ignore malformed files */ }
+  }
+
+  /**
+   * Extract usage events from a full session object (used by both .json files
+   * and kind=0 snapshots in .jsonl files).
+   */
+  private extractFromSessionObject(filePath: string, session: Record<string, unknown>): void {
+    if (typeof session.customTitle === 'string') {
+      this.sessionTitleByFile.set(filePath, session.customTitle);
+    }
+
+    const requests = session.requests;
+    if (!Array.isArray(requests)) return;
+
+    for (const req of requests) {
+      if (!req || typeof req !== 'object') continue;
+      const obj = req as Record<string, unknown>;
+
+      const meta = this.extractMetaFromRequest(filePath, obj);
+      if (!meta.requestId) continue;
+
+      const credits = this.extractCreditsFromRequest(obj);
+      if (credits !== undefined) {
+        this.emitUsage(meta, credits);
+      }
+    }
+  }
+
   private parseLine(filePath: string, line: string): void {
     let obj: ChatSessionDelta;
     try {
       obj = JSON.parse(line) as ChatSessionDelta;
     } catch {
+      return;
+    }
+
+    // kind=0: full session snapshot — the v field contains the entire session
+    if (obj.kind === 0 && obj.v && typeof obj.v === 'object' && !Array.isArray(obj.v)) {
+      this.extractFromSessionObject(filePath, obj.v as Record<string, unknown>);
       return;
     }
 

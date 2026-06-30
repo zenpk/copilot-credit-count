@@ -30,8 +30,12 @@ export function activate(context: vscode.ExtensionContext) {
   const userDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..').fsPath;
   workspaceStorageDir = path.join(userDir, 'workspaceStorage');
 
+  const scanDirs = [workspaceStorageDir];
+  const emptyWindowChatDir = path.join(userDir, 'globalStorage', 'emptyWindowChatSessions');
+  scanDirs.push(emptyWindowChatDir);
+
   const syncMeta = storage.loadSyncMeta();
-  watcher = new CopilotCreditsWatcher(workspaceStorageDir);
+  watcher = new CopilotCreditsWatcher(scanDirs);
   watcher.on('usage', onUsage);
   watcher.start(syncMeta.synced);
 
@@ -53,7 +57,12 @@ export function activate(context: vscode.ExtensionContext) {
 
 async function cmdResync() {
   watcher.stop();
-  watcher = new CopilotCreditsWatcher(workspaceStorageDir);
+  const userDir = path.dirname(path.dirname(workspaceStorageDir));
+  const scanDirs = [
+    workspaceStorageDir,
+    path.join(userDir, 'globalStorage', 'emptyWindowChatSessions'),
+  ];
+  watcher = new CopilotCreditsWatcher(scanDirs);
   watcher.on('usage', onUsage);
   watcher.start(false);
   storage.saveSyncMeta({ synced: true, lastSyncTime: new Date().toISOString() });
@@ -87,12 +96,8 @@ function updateStatusBar() {
   const now = new Date();
   const entries = storage.getByMonth(now.getFullYear(), now.getMonth() + 1);
   const s = storage.summarize(entries);
-  const syncMeta = storage.loadSyncMeta();
-  const lastSync = syncMeta.lastSyncTime
-    ? new Date(syncMeta.lastSyncTime).toLocaleString()
-    : 'never';
-  statusBar.text = `$(credit-card) ${s.totalCredits.toFixed(1)} credits`;
-  statusBar.tooltip = `Copilot Credits this month: ${s.totalCredits.toFixed(1)}\nLast synced: ${lastSync}\nClick to open dashboard`;
+  statusBar.text = `$(credit-card) $${(s.totalCredits/100).toFixed(2)}`;
+  statusBar.tooltip = `Copilot Credits this month: ${s.totalCredits.toFixed(1)}\nClick to open dashboard`;
 }
 
 export function deactivate() {}
