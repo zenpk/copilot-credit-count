@@ -8,7 +8,6 @@ import { CopilotCreditsWatcher } from './watcher';
 let storage: CreditsStorage;
 let watcher: CopilotCreditsWatcher;
 let statusBar: vscode.StatusBarItem;
-let workspaceStorageDir: string;
 
 function onUsage(event: UsageEvent) {
   const entry = storage.add(event);
@@ -16,6 +15,13 @@ function onUsage(event: UsageEvent) {
     updateStatusBar();
     refreshDashboard(storage);
   }
+}
+
+function getScanDirs(userDir: string): string[] {
+  return [
+    path.join(userDir, 'workspaceStorage'),
+    path.join(userDir, 'globalStorage', 'emptyWindowChatSessions'),
+  ];
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -28,47 +34,18 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.show();
 
   const userDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..').fsPath;
-  workspaceStorageDir = path.join(userDir, 'workspaceStorage');
-
-  const scanDirs = [workspaceStorageDir];
-  const emptyWindowChatDir = path.join(userDir, 'globalStorage', 'emptyWindowChatSessions');
-  scanDirs.push(emptyWindowChatDir);
-
-  const syncMeta = storage.loadSyncMeta();
-  watcher = new CopilotCreditsWatcher(scanDirs);
+  watcher = new CopilotCreditsWatcher(getScanDirs(userDir));
   watcher.on('usage', onUsage);
-  watcher.start(syncMeta.synced);
-
-  if (!syncMeta.synced) {
-    storage.saveSyncMeta({ synced: true, lastSyncTime: new Date().toISOString() });
-    updateStatusBar();
-  }
+  watcher.start();
 
   context.subscriptions.push(
     vscode.commands.registerCommand('copilot-credit-count.showDashboard', () =>
       showDashboard(context, storage),
     ),
     vscode.commands.registerCommand('copilot-credit-count.openStorageFile', cmdOpenStorageFile),
-    vscode.commands.registerCommand('copilot-credit-count.resync', cmdResync),
     statusBar,
     { dispose: () => watcher.stop() },
   );
-}
-
-async function cmdResync() {
-  watcher.stop();
-  const userDir = path.dirname(path.dirname(workspaceStorageDir));
-  const scanDirs = [
-    workspaceStorageDir,
-    path.join(userDir, 'globalStorage', 'emptyWindowChatSessions'),
-  ];
-  watcher = new CopilotCreditsWatcher(scanDirs);
-  watcher.on('usage', onUsage);
-  watcher.start(false);
-  storage.saveSyncMeta({ synced: true, lastSyncTime: new Date().toISOString() });
-  updateStatusBar();
-  refreshDashboard(storage);
-  vscode.window.showInformationMessage('Copilot Credit Count: Resync complete.');
 }
 
 async function cmdOpenStorageFile() {
@@ -96,7 +73,7 @@ function updateStatusBar() {
   const now = new Date();
   const entries = storage.getByMonth(now.getFullYear(), now.getMonth() + 1);
   const s = storage.summarize(entries);
-  statusBar.text = `$(credit-card) $${(s.totalCredits/100).toFixed(2)}`;
+  statusBar.text = `$(credit-card) $${(s.totalCredits / 100).toFixed(2)}`;
   statusBar.tooltip = `Copilot Credits this month: ${s.totalCredits.toFixed(1)}\nClick to open dashboard`;
 }
 

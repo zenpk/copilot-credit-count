@@ -15,11 +15,6 @@ export interface Summary {
   totalCredits: number;
 }
 
-export interface SyncMeta {
-  synced: boolean;
-  lastSyncTime: string;
-}
-
 export class CreditsStorage {
   private readonly storageDir: string;
   private readonly seenIds = new Map<string, { month: string; credits: number }>();
@@ -166,24 +161,5 @@ export class CreditsStorage {
       }),
       { count: 0, totalCredits: 0 },
     );
-  }
-
-  // --- sync meta ---
-
-  private syncMetaPath(): string {
-    return path.join(this.storageDir, 'sync-meta.json');
-  }
-
-  loadSyncMeta(): SyncMeta {
-    try {
-      const raw = fs.readFileSync(this.syncMetaPath(), 'utf-8');
-      return JSON.parse(raw) as SyncMeta;
-    } catch {
-      return { synced: false, lastSyncTime: '' };
-    }
-  }
-
-  saveSyncMeta(meta: SyncMeta): void {
-    fs.writeFileSync(this.syncMetaPath(), JSON.stringify(meta, null, 2), 'utf-8');
   }
 }

@@ -46,24 +46,20 @@ export class CopilotCreditsWatcher extends EventEmitter {
     this.scanDirs = scanDirs;
   }
 
-  /**
-   * @param skipBackfill When true, fast-forwards all existing files to the end
-   * and only captures new data going forward. When false, reads all files from
-   * the beginning (full scan).
-   */
-  start(skipBackfill: boolean): void {
+  /** Attach watchers and fast-forward existing files — only new writes are recorded. */
+  start(): void {
     for (const dir of this.scanDirs) {
       if (fs.existsSync(dir)) {
-        this.startDir(dir, skipBackfill);
+        this.startDir(dir);
       }
     }
   }
 
-  private startDir(baseDir: string, skipBackfill: boolean): void {
+  private startDir(baseDir: string): void {
     const chatDirs = this.discoverChatDirs(baseDir);
 
     for (const chatDir of chatDirs) {
-      this.trackChatDir(chatDir, skipBackfill);
+      this.trackChatDir(chatDir);
     }
 
     // If baseDir itself is a chatSessions-style dir, watch it for new files directly
@@ -87,19 +83,14 @@ export class CopilotCreditsWatcher extends EventEmitter {
     }
   }
 
-  private trackChatDir(chatDir: string, skipBackfill: boolean): void {
+  private trackChatDir(chatDir: string): void {
     if (this.trackedChatDirs.has(chatDir)) return;
     this.trackedChatDirs.add(chatDir);
 
     const files = this.listSessionFiles(chatDir);
     for (const filePath of files) {
-      if (skipBackfill) {
-        try { this.filePositions.set(filePath, fs.statSync(filePath).size); } catch { /* ignore */ }
-      }
+      this.fastForwardFile(filePath);
       this.watchFile(filePath);
-      if (!skipBackfill) {
-        this.processFile(filePath);
-      }
     }
 
     try {
@@ -169,7 +160,15 @@ export class CopilotCreditsWatcher extends EventEmitter {
     if (!this.isDirectory(workspaceDir)) return;
     const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
     if (!this.isDirectory(chatSessionsDir)) return;
-    this.trackChatDir(chatSessionsDir, false);
+    this.trackChatDir(chatSessionsDir);
+  }
+
+  /** Skip existing content so only appends after tracking begins are read. */
+  private fastForwardFile(filePath: string): void {
+    try {
+      const size = fs.statSync(filePath).size;
+      this.filePositions.set(filePath, Math.max(size, 1));
+    } catch { /* ignore */ }
   }
 
   private isDirectory(dirPath: string): boolean {
