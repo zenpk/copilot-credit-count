@@ -9,7 +9,7 @@ Track and visualize your GitHub Copilot credit usage directly in VS Code.
 - **Real-time tracking** — Records Copilot credit usage from the moment the extension is installed; only new usage is counted.
 - **Interactive dashboard** — Filter by month or model, sort by date or credits, and view per-model breakdowns.
 - **Status bar** — Shows your current month's credit total at a glance.
-- **Monthly storage** — Credit data is stored in separate monthly JSON files for clean isolation.
+- **Monthly storage** — Credit data is stored in separate monthly JSON files for clean isolation, and entries are appended rather than rewritten.
 
 ## Usage
 
@@ -19,7 +19,7 @@ Track and visualize your GitHub Copilot credit usage directly in VS Code.
 
 ## How It Works
 
-The extension watches VS Code's Copilot Chat session files (`workspaceStorage/*/chatSessions/` and `globalStorage/emptyWindowChatSessions/`) and records credit usage as new data is written. Past usage before install is not backfilled. Data is aggregated into monthly JSON files stored in your user data directory.
+The extension watches VS Code's Copilot Chat session files (`workspaceStorage/*/chatSessions/` and `globalStorage/emptyWindowChatSessions/`) and records credit usage as new data is written. Past usage before install is not backfilled. Data is aggregated into append-only monthly JSON files stored in your user data directory.
 
 ## Data Storage
 

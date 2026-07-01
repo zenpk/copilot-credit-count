@@ -33,7 +33,8 @@ const MODEL_FIELDS = new Set([
 
 export class CopilotCreditsWatcher extends EventEmitter {
   private readonly scanDirs: string[];
-  private readonly filePositions = new Map<string, number>();
+  private readonly sessionFileState = new Map<string, { position: number; size: number; mtimeMs: number }>();
+  private readonly jsonFileState = new Map<string, { size: number; mtimeMs: number }>();
   private readonly trackedChatDirs = new Set<string>();
   private readonly requestMetaByFile = new Map<string, Map<number, RequestMeta>>();
   private readonly pendingCreditsByFile = new Map<string, Map<number, number>>();
@@ -114,7 +115,8 @@ export class CopilotCreditsWatcher extends EventEmitter {
     for (const w of this.fileWatchers.values()) w.close();
     this.dirWatchers.length = 0;
     this.fileWatchers.clear();
-    this.filePositions.clear();
+    this.sessionFileState.clear();
+    this.jsonFileState.clear();
     this.requestMetaByFile.clear();
     this.pendingCreditsByFile.clear();
     this.sessionTitleByFile.clear();
@@ -166,8 +168,12 @@ export class CopilotCreditsWatcher extends EventEmitter {
   /** Skip existing content so only appends after tracking begins are read. */
   private fastForwardFile(filePath: string): void {
     try {
-      const size = fs.statSync(filePath).size;
-      this.filePositions.set(filePath, Math.max(size, 1));
+      const stat = fs.statSync(filePath);
+      this.sessionFileState.set(filePath, {
+        position: stat.size,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      });
     } catch { /* ignore */ }
   }
 
@@ -197,15 +203,48 @@ export class CopilotCreditsWatcher extends EventEmitter {
       }
 
       const stat = fs.statSync(filePath);
-      const lastPos = this.filePositions.get(filePath) ?? 0;
-      if (stat.size <= lastPos) return;
+      const state = this.sessionFileState.get(filePath);
+      const rewrote =
+        !!state
+        && (stat.size < state.position || (stat.mtimeMs !== state.mtimeMs && stat.size <= state.size));
+
+      if (rewrote) {
+        // Copilot occasionally rewrites session files. Treat rewrites as a reset
+        // so we can continue following the file without losing future writes.
+        this.resetFileState(filePath);
+        this.sessionFileState.set(filePath, {
+          position: 0,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+        });
+      }
+
+      const currentState = this.sessionFileState.get(filePath);
+      const startPos = currentState?.position ?? 0;
+      if (stat.size <= startPos) {
+        if (currentState) {
+          currentState.size = stat.size;
+          currentState.mtimeMs = stat.mtimeMs;
+        } else {
+          this.sessionFileState.set(filePath, {
+            position: startPos,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+          });
+        }
+        return;
+      }
 
       const fd = fs.openSync(filePath, 'r');
-      const buf = Buffer.alloc(stat.size - lastPos);
-      const bytesRead = fs.readSync(fd, buf, 0, buf.length, lastPos);
+      const buf = Buffer.alloc(stat.size - startPos);
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, startPos);
       fs.closeSync(fd);
 
-      this.filePositions.set(filePath, lastPos + bytesRead);
+      this.sessionFileState.set(filePath, {
+        position: startPos + bytesRead,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      });
 
       const chunk = buf.subarray(0, bytesRead).toString('utf-8');
       for (const rawLine of chunk.split('\n')) {
@@ -220,15 +259,23 @@ export class CopilotCreditsWatcher extends EventEmitter {
 
   /** Handle legacy .json session files (single JSON object with requests array). */
   private processJsonFile(filePath: string): void {
-    if (this.filePositions.has(filePath)) return;
-    this.filePositions.set(filePath, 1);
-
     try {
+      const stat = fs.statSync(filePath);
+      const previous = this.jsonFileState.get(filePath);
+      if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) return;
+      this.jsonFileState.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs });
+
       const content = fs.readFileSync(filePath, 'utf-8');
       const session = JSON.parse(content);
       if (!session || typeof session !== 'object') return;
       this.extractFromSessionObject(filePath, session);
     } catch { /* ignore malformed files */ }
+  }
+
+  private resetFileState(filePath: string): void {
+    this.requestMetaByFile.delete(filePath);
+    this.pendingCreditsByFile.delete(filePath);
+    this.sessionTitleByFile.delete(filePath);
   }
 
   /**
