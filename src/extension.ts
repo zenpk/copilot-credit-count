@@ -1,80 +1,109 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { showDashboard, refreshDashboard } from './dashboard';
+import { refreshDashboard, showDashboard } from './dashboard';
 import { CreditsStorage } from './storage';
-import type { UsageEvent } from './watcher';
-import { CopilotCreditsWatcher } from './watcher';
+import { CopilotCreditsWatcher, type UsageEvent } from './watcher';
+
+const SHOW_DASHBOARD_COMMAND = 'copilot-credit-count.showDashboard';
+const OPEN_STORAGE_FILE_COMMAND = 'copilot-credit-count.openStorageFile';
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 let storage: CreditsStorage;
 let watcher: CopilotCreditsWatcher;
 let statusBar: vscode.StatusBarItem;
+let storageErrorShown = false;
 
-function onUsage(event: UsageEvent) {
-  const entry = storage.add(event);
-  if (entry) {
-    updateStatusBar();
-    refreshDashboard(storage);
-  }
-}
+export function activate(context: vscode.ExtensionContext): void {
+  storage = new CreditsStorage(storageDirFor(context));
+  statusBar = createStatusBarItem();
+  watcher = new CopilotCreditsWatcher(scanDirsFor(context));
 
-function getScanDirs(userDir: string): string[] {
-  return [
-    path.join(userDir, 'workspaceStorage'),
-    path.join(userDir, 'globalStorage', 'emptyWindowChatSessions'),
-  ];
-}
-
-export function activate(context: vscode.ExtensionContext) {
-  const storageDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..', '..', 'copilot-credit-count').fsPath;
-  storage = new CreditsStorage(storageDir);
-
-  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = 'copilot-credit-count.showDashboard';
-  updateStatusBar();
-  statusBar.show();
-
-  const userDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..').fsPath;
-  watcher = new CopilotCreditsWatcher(getScanDirs(userDir));
-  watcher.on('usage', onUsage);
+  watcher.on('usage', recordUsage);
   watcher.start();
+  updateStatusBar();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('copilot-credit-count.showDashboard', () =>
-      showDashboard(context, storage),
-    ),
-    vscode.commands.registerCommand('copilot-credit-count.openStorageFile', cmdOpenStorageFile),
+    vscode.commands.registerCommand(SHOW_DASHBOARD_COMMAND, () => showDashboard(context, storage)),
+    vscode.commands.registerCommand(OPEN_STORAGE_FILE_COMMAND, openStorageFile),
     statusBar,
     { dispose: () => watcher.stop() },
   );
 }
 
-async function cmdOpenStorageFile() {
+export function deactivate(): void {
+  watcher?.stop();
+}
+
+function createStatusBarItem(): vscode.StatusBarItem {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  item.command = SHOW_DASHBOARD_COMMAND;
+  item.show();
+  return item;
+}
+
+function recordUsage(event: UsageEvent): void {
+  try {
+    const entry = storage.add(event);
+    if (!entry) return;
+
+    updateStatusBar();
+    refreshDashboard(storage);
+  } catch (error) {
+    if (storageErrorShown) return;
+    storageErrorShown = true;
+    vscode.window.showErrorMessage(error instanceof Error ? error.message : 'Unable to record Copilot credit usage.');
+  }
+}
+
+async function openStorageFile(): Promise<void> {
+  const month = await pickStorageMonth();
+  if (!month) return;
+
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.file(storage.getMonthFilePath(month)));
+  await vscode.window.showTextDocument(document, { preview: false });
+}
+
+async function pickStorageMonth(): Promise<string | undefined> {
   const months = storage.getAvailableMonths();
   if (months.length === 0) {
     vscode.window.showInformationMessage('No credit data files found.');
-    return;
+    return undefined;
   }
 
-  const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const items = months.map((m) => {
-    const [y, mo] = m.split('-').map(Number);
-    return { label: `${MONTH_NAMES[mo - 1]} ${y}`, description: m, month: m };
-  });
+  const picked = await vscode.window.showQuickPick(
+    months.map((month) => ({
+      label: monthLabel(month),
+      description: month,
+      month,
+    })),
+    { placeHolder: 'Select month to open' },
+  );
 
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select month to open' });
-  if (!picked) return;
-
-  const filePath = storage.getMonthFilePath(picked.month);
-  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-  await vscode.window.showTextDocument(doc, { preview: false });
+  return picked?.month;
 }
 
-function updateStatusBar() {
+function monthLabel(month: string): string {
+  const [year, monthNumber] = month.split('-').map(Number);
+  return `${MONTH_NAMES[monthNumber - 1]} ${year}`;
+}
+
+function updateStatusBar(): void {
   const now = new Date();
   const entries = storage.getByMonth(now.getFullYear(), now.getMonth() + 1);
-  const s = storage.summarize(entries);
-  statusBar.text = `$(credit-card) $${(s.totalCredits / 100).toFixed(2)}`;
-  statusBar.tooltip = `Copilot Credits this month: ${s.totalCredits.toFixed(1)}\nClick to open dashboard`;
+  const summary = storage.summarize(entries);
+
+  statusBar.text = `$(credit-card) $${(summary.totalCredits / 100).toFixed(2)}`;
+  statusBar.tooltip = `Copilot Credits this month: ${summary.totalCredits.toFixed(1)}\nClick to open dashboard`;
 }
 
-export function deactivate() {}
+function storageDirFor(context: vscode.ExtensionContext): string {
+  return vscode.Uri.joinPath(context.globalStorageUri, '..', '..', '..', 'copilot-credit-count').fsPath;
+}
+
+function scanDirsFor(context: vscode.ExtensionContext): string[] {
+  const userDir = vscode.Uri.joinPath(context.globalStorageUri, '..', '..').fsPath;
+  return [
+    path.join(userDir, 'workspaceStorage'),
+    path.join(userDir, 'globalStorage', 'emptyWindowChatSessions'),
+  ];
+}

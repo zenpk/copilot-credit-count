@@ -1,6 +1,6 @@
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
-import { EventEmitter } from 'events';
 
 export interface UsageEvent {
   sourceId: string;
@@ -10,77 +10,85 @@ export interface UsageEvent {
   context?: string;
 }
 
-interface ChatSessionDelta {
+interface FileCursor {
+  offset: number;
+  size: number;
+  mtimeMs: number;
+}
+
+interface SessionState {
+  title?: string;
+  requests: Map<number, RequestState>;
+}
+
+interface RequestState {
+  requestId?: string;
+  timestamp?: number;
+  credits?: number;
+  model?: string;
+  context?: string;
+}
+
+interface ChatDelta {
   kind?: number;
   k?: Array<string | number>;
   v?: unknown;
 }
 
-interface RequestMeta {
-  requestId?: string;
-  timestamp?: number;
-  model?: string;
-  context?: string;
-}
-
-const MODEL_FIELDS = new Set([
-  'model',
-  'modelSlug',
-  'modelId',
-  'chatModelId',
-  'selectedModelId',
-]);
+const MODEL_FIELDS = ['model', 'modelSlug', 'modelId', 'chatModelId', 'selectedModelId'];
 
 export class CopilotCreditsWatcher extends EventEmitter {
-  private readonly scanDirs: string[];
-  private readonly sessionFileState = new Map<string, { position: number; size: number; mtimeMs: number }>();
-  private readonly jsonFileState = new Map<string, { size: number; mtimeMs: number }>();
-  private readonly trackedChatDirs = new Set<string>();
-  private readonly requestMetaByFile = new Map<string, Map<number, RequestMeta>>();
-  private readonly pendingCreditsByFile = new Map<string, Map<number, number>>();
-  private readonly sessionTitleByFile = new Map<string, string>();
-  private readonly dirWatchers: fs.FSWatcher[] = [];
+  private readonly directoryWatchers: fs.FSWatcher[] = [];
   private readonly fileWatchers = new Map<string, fs.FSWatcher>();
+  private readonly cursors = new Map<string, FileCursor>();
+  private readonly trackedChatDirs = new Set<string>();
+  private readonly sessions = new Map<string, SessionState>();
 
-  constructor(scanDirs: string[]) {
+  constructor(private readonly scanDirs: string[]) {
     super();
-    this.scanDirs = scanDirs;
   }
 
-  /** Attach watchers and fast-forward existing files — only new writes are recorded. */
   start(): void {
-    for (const dir of this.scanDirs) {
-      if (fs.existsSync(dir)) {
-        this.startDir(dir);
-      }
+    for (const scanDir of this.scanDirs) {
+      this.trackScanDir(scanDir);
     }
   }
 
-  private startDir(baseDir: string): void {
-    const chatDirs = this.discoverChatDirs(baseDir);
+  stop(): void {
+    for (const watcher of this.directoryWatchers) watcher.close();
+    for (const watcher of this.fileWatchers.values()) watcher.close();
 
-    for (const chatDir of chatDirs) {
-      this.trackChatDir(chatDir);
+    this.directoryWatchers.length = 0;
+    this.fileWatchers.clear();
+    this.cursors.clear();
+    this.trackedChatDirs.clear();
+    this.sessions.clear();
+  }
+
+  private trackScanDir(scanDir: string): void {
+    if (!this.isDirectory(scanDir)) return;
+
+    if (this.isChatSessionsDir(scanDir)) {
+      this.trackChatDir(scanDir);
+      return;
     }
 
-    // If baseDir itself is a chatSessions-style dir, watch it for new files directly
-    if (chatDirs.includes(baseDir)) return;
+    this.trackKnownWorkspaceDirs(scanDir);
+    this.watchDirectory(scanDir, (entryName) => {
+      this.trackWorkspaceDir(path.join(scanDir, entryName));
+    });
+  }
 
-    // Otherwise watch for new workspace subdirectories appearing
-    try {
-      const top = fs.watch(
-        baseDir,
-        { recursive: false, encoding: 'utf8' },
-        (_event: fs.WatchEventType, filename: string | null) => {
-          if (!filename) return;
-          this.onNewSubdir(path.join(baseDir, filename));
-        },
-      );
-      this.dirWatchers.push(top);
-    } catch { /* dir may not be watchable */ }
+  private trackKnownWorkspaceDirs(scanDir: string): void {
+    for (const entryName of this.readDirNames(scanDir)) {
+      this.trackWorkspaceDir(path.join(scanDir, entryName));
+    }
+  }
 
-    for (const entry of fs.readdirSync(baseDir)) {
-      this.onNewSubdir(path.join(baseDir, entry));
+  private trackWorkspaceDir(workspaceDir: string): void {
+    const chatDir = path.join(workspaceDir, 'chatSessions');
+    if (this.isDirectory(chatDir)) {
+      this.trackChatDir(chatDir);
     }
   }
 
@@ -88,501 +96,377 @@ export class CopilotCreditsWatcher extends EventEmitter {
     if (this.trackedChatDirs.has(chatDir)) return;
     this.trackedChatDirs.add(chatDir);
 
-    const files = this.listSessionFiles(chatDir);
-    for (const filePath of files) {
-      this.fastForwardFile(filePath);
-      this.watchFile(filePath);
+    for (const filePath of this.listSessionFiles(chatDir)) {
+      this.fastForward(filePath);
+      this.watchSessionFile(filePath);
     }
 
+    this.watchDirectory(chatDir, (entryName) => {
+      if (!this.isSessionFileName(entryName)) return;
+      const filePath = path.join(chatDir, entryName);
+      this.watchSessionFile(filePath);
+      this.processSessionFile(filePath);
+    });
+  }
+
+  private watchDirectory(dirPath: string, onEntry: (entryName: string) => void): void {
     try {
-      const watcher = fs.watch(
-        chatDir,
-        { recursive: false, encoding: 'utf8' },
-        (_event: fs.WatchEventType, filename: string | null) => {
-          if (!filename) return;
-          if (!filename.endsWith('.jsonl') && !filename.endsWith('.json')) return;
-          const filePath = path.join(chatDir, filename);
-          this.watchFile(filePath);
-          this.processFile(filePath);
-        },
-      );
-      this.dirWatchers.push(watcher);
-    } catch { /* ignore */ }
+      const watcher = fs.watch(dirPath, { recursive: false, encoding: 'utf8' }, (_event, fileName) => {
+        if (fileName) onEntry(fileName);
+      });
+      this.directoryWatchers.push(watcher);
+    } catch {
+      // Some VS Code storage dirs are transient or not watchable on startup.
+    }
   }
 
-  stop(): void {
-    for (const w of this.dirWatchers) w.close();
-    for (const w of this.fileWatchers.values()) w.close();
-    this.dirWatchers.length = 0;
-    this.fileWatchers.clear();
-    this.sessionFileState.clear();
-    this.jsonFileState.clear();
-    this.requestMetaByFile.clear();
-    this.pendingCreditsByFile.clear();
-    this.sessionTitleByFile.clear();
-    this.trackedChatDirs.clear();
+  private watchSessionFile(filePath: string): void {
+    if (this.fileWatchers.has(filePath)) return;
+
+    try {
+      const watcher = fs.watch(filePath, () => {
+        this.processSessionFile(filePath);
+      });
+      this.fileWatchers.set(filePath, watcher);
+    } catch {
+      // The directory watcher will try again when VS Code finishes creating it.
+    }
   }
 
-  /** Find all chatSessions directories under a base directory. */
-  private discoverChatDirs(baseDir: string): string[] {
-    const result: string[] = [];
-
-    // baseDir itself might be a chatSessions dir (e.g. emptyWindowChatSessions)
-    if (path.basename(baseDir).toLowerCase().includes('chatsessions')) {
-      if (this.isDirectory(baseDir)) result.push(baseDir);
-      return result;
+  private processSessionFile(filePath: string): void {
+    if (filePath.endsWith('.json')) {
+      this.processJsonSession(filePath);
+      return;
     }
 
-    // Scan subdirectories for chatSessions folders
+    this.processJsonLinesSession(filePath);
+  }
+
+  private processJsonLinesSession(filePath: string): void {
     try {
-      for (const entry of fs.readdirSync(baseDir)) {
-        const chatDir = path.join(baseDir, entry, 'chatSessions');
-        if (this.isDirectory(chatDir)) {
-          result.push(chatDir);
-        }
+      const stat = fs.statSync(filePath);
+      const cursor = this.nextCursor(filePath, stat);
+      if (stat.size <= cursor.offset) return;
+
+      const fd = fs.openSync(filePath, 'r');
+      const buffer = Buffer.alloc(stat.size - cursor.offset);
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, cursor.offset);
+      fs.closeSync(fd);
+
+      this.cursors.set(filePath, {
+        offset: cursor.offset + bytesRead,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      });
+
+      for (const line of buffer.subarray(0, bytesRead).toString('utf8').split('\n')) {
+        this.processJsonLine(filePath, line);
       }
-    } catch { /* ignore */ }
-
-    return result;
+    } catch {
+      // Copilot can write these files in small chunks; the next event will retry.
+    }
   }
 
-  /** List both .jsonl and .json session files in a directory. */
-  private listSessionFiles(dir: string): string[] {
+  private processJsonSession(filePath: string): void {
     try {
-      return fs.readdirSync(dir)
-        .filter(f => f.endsWith('.jsonl') || f.endsWith('.json'))
-        .map(f => path.join(dir, f));
+      const stat = fs.statSync(filePath);
+      const previous = this.cursors.get(filePath);
+      if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) return;
+
+      this.cursors.set(filePath, { offset: stat.size, size: stat.size, mtimeMs: stat.mtimeMs });
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as unknown;
+      if (this.isRecord(parsed)) {
+        this.mergeSessionSnapshot(filePath, parsed);
+      }
+    } catch {
+      // Ignore half-written legacy snapshots.
+    }
+  }
+
+  private nextCursor(filePath: string, stat: fs.Stats): FileCursor {
+    const previous = this.cursors.get(filePath);
+    if (!previous) {
+      return { offset: 0, size: stat.size, mtimeMs: stat.mtimeMs };
+    }
+
+    const rewritten = stat.size < previous.offset || (stat.mtimeMs !== previous.mtimeMs && stat.size <= previous.size);
+    if (rewritten) {
+      this.sessions.delete(filePath);
+      return { offset: 0, size: stat.size, mtimeMs: stat.mtimeMs };
+    }
+
+    return previous;
+  }
+
+  private processJsonLine(filePath: string, rawLine: string): void {
+    const line = rawLine.trim();
+    if (!line) return;
+
+    try {
+      this.processDelta(filePath, JSON.parse(line) as ChatDelta);
+    } catch {
+      // Skip malformed fragments from in-progress writes.
+    }
+  }
+
+  private processDelta(filePath: string, delta: ChatDelta): void {
+    if (delta.kind === 0 && this.isRecord(delta.v)) {
+      this.mergeSessionSnapshot(filePath, delta.v);
+      return;
+    }
+
+    if (!Array.isArray(delta.k)) return;
+
+    const key = delta.k;
+    if (key.length === 1 && key[0] === 'customTitle' && typeof delta.v === 'string') {
+      this.stateFor(filePath).title = delta.v;
+      return;
+    }
+
+    if (key[0] !== 'requests') return;
+
+    if (key.length === 1 && Array.isArray(delta.v)) {
+      this.mergeRequestArray(filePath, 0, delta.v);
+      return;
+    }
+
+    if (typeof key[1] !== 'number') return;
+    const index = key[1];
+
+    if (key.length === 2 && Array.isArray(delta.v)) {
+      this.mergeRequestArray(filePath, index, delta.v);
+      return;
+    }
+
+    this.mergeRequestField(filePath, index, key.slice(2), delta.v);
+  }
+
+  private mergeSessionSnapshot(filePath: string, snapshot: Record<string, unknown>): void {
+    if (typeof snapshot.customTitle === 'string') {
+      this.stateFor(filePath).title = snapshot.customTitle;
+    }
+
+    if (Array.isArray(snapshot.requests)) {
+      this.mergeRequestArray(filePath, 0, snapshot.requests);
+    }
+  }
+
+  private mergeRequestArray(filePath: string, startIndex: number, requests: unknown[]): void {
+    requests.forEach((request, offset) => {
+      if (!this.isRecord(request)) return;
+      this.mergeRequestPatch(filePath, startIndex + offset, this.requestFromObject(filePath, request));
+    });
+  }
+
+  private mergeRequestField(filePath: string, index: number, pathParts: Array<string | number>, value: unknown): void {
+    const [field, nestedField] = pathParts;
+    if (typeof field !== 'string') return;
+
+    if (pathParts.length === 1) {
+      if (field === 'requestId' && typeof value === 'string') {
+        this.mergeRequestPatch(filePath, index, { requestId: value });
+        return;
+      }
+
+      if (field === 'timestamp' && typeof value === 'number') {
+        this.mergeRequestPatch(filePath, index, { timestamp: value });
+        return;
+      }
+
+      if (field === 'copilotCredits' && typeof value === 'number') {
+        this.mergeRequestPatch(filePath, index, { credits: value });
+        return;
+      }
+
+      if (MODEL_FIELDS.includes(field)) {
+        this.mergeRequestPatch(filePath, index, { model: this.modelFrom(value) });
+        return;
+      }
+
+      if (field === 'message' && this.isRecord(value)) {
+        this.mergeRequestPatch(filePath, index, { context: this.contextFromMessage(filePath, value) });
+        return;
+      }
+
+      if ((field === 'result' || field === 'response') && this.isRecord(value)) {
+        this.mergeRequestPatch(filePath, index, this.resultFromObject(value));
+      }
+
+      return;
+    }
+
+    if ((field !== 'result' && field !== 'response') || typeof nestedField !== 'string') return;
+
+    if (nestedField === 'copilotCredits' && typeof value === 'number') {
+      this.mergeRequestPatch(filePath, index, { credits: value });
+      return;
+    }
+
+    if (nestedField === 'modelName' || MODEL_FIELDS.includes(nestedField)) {
+      this.mergeRequestPatch(filePath, index, { model: this.modelFrom(value) });
+    }
+  }
+
+  private mergeRequestPatch(filePath: string, index: number, patch: RequestState): void {
+    const state = this.stateFor(filePath);
+    const current = state.requests.get(index) ?? {};
+    const next = this.compactRequestState({ ...current, ...patch });
+
+    state.requests.set(index, next);
+    this.emitIfComplete(next);
+  }
+
+  private compactRequestState(request: RequestState): RequestState {
+    return {
+      requestId: request.requestId,
+      timestamp: request.timestamp,
+      credits: request.credits,
+      model: request.model,
+      context: request.context,
+    };
+  }
+
+  private requestFromObject(filePath: string, request: Record<string, unknown>): RequestState {
+    return {
+      requestId: typeof request.requestId === 'string' ? request.requestId : undefined,
+      timestamp: typeof request.timestamp === 'number' ? request.timestamp : undefined,
+      credits: this.creditsFromObject(request),
+      model: this.firstModel(request, MODEL_FIELDS) ?? this.modelFromResult(request.result) ?? this.modelFromResult(request.response),
+      context: this.contextFromMessage(filePath, request.message),
+    };
+  }
+
+  private resultFromObject(result: Record<string, unknown>): RequestState {
+    return {
+      credits: typeof result.copilotCredits === 'number' ? result.copilotCredits : undefined,
+      model: this.modelFrom(result.model) ?? this.modelFrom(result.modelName),
+    };
+  }
+
+  private creditsFromObject(request: Record<string, unknown>): number | undefined {
+    if (typeof request.copilotCredits === 'number') return request.copilotCredits;
+
+    const resultCredits = this.creditsFromResult(request.result);
+    if (resultCredits !== undefined) return resultCredits;
+
+    return this.creditsFromResult(request.response);
+  }
+
+  private creditsFromResult(result: unknown): number | undefined {
+    if (!this.isRecord(result)) return undefined;
+    return typeof result.copilotCredits === 'number' ? result.copilotCredits : undefined;
+  }
+
+  private modelFromResult(result: unknown): string | undefined {
+    if (!this.isRecord(result)) return undefined;
+    return this.modelFrom(result.model) ?? this.modelFrom(result.modelName);
+  }
+
+  private firstModel(record: Record<string, unknown>, fields: string[]): string | undefined {
+    for (const field of fields) {
+      const model = this.modelFrom(record[field]);
+      if (model) return model;
+    }
+    return undefined;
+  }
+
+  private modelFrom(value: unknown): string | undefined {
+    if (typeof value === 'string') return this.cleanText(value);
+    if (!this.isRecord(value)) return undefined;
+    return this.firstString(value, ['id', 'name', 'modelId', 'slug']);
+  }
+
+  private contextFromMessage(filePath: string, message: unknown): string | undefined {
+    const title = this.cleanText(this.stateFor(filePath).title);
+    if (title) return title;
+
+    if (!this.isRecord(message)) return undefined;
+    return typeof message.text === 'string' ? this.cleanText(message.text, 100) : undefined;
+  }
+
+  private emitIfComplete(request: RequestState): void {
+    if (!request.requestId || !request.credits || request.credits <= 0) return;
+
+    this.emit('usage', {
+      sourceId: request.requestId,
+      timestamp: this.timestampFrom(request.timestamp),
+      credits: request.credits,
+      model: request.model,
+      context: request.context,
+    } satisfies UsageEvent);
+  }
+
+  private timestampFrom(timestamp: number | undefined): string {
+    if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
+      return new Date(timestamp).toISOString();
+    }
+    return new Date().toISOString();
+  }
+
+  private stateFor(filePath: string): SessionState {
+    const existing = this.sessions.get(filePath);
+    if (existing) return existing;
+
+    const created = { requests: new Map<number, RequestState>() };
+    this.sessions.set(filePath, created);
+    return created;
+  }
+
+  private fastForward(filePath: string): void {
+    try {
+      const stat = fs.statSync(filePath);
+      this.cursors.set(filePath, { offset: stat.size, size: stat.size, mtimeMs: stat.mtimeMs });
+    } catch {
+      // The file can disappear while Copilot tidies sessions.
+    }
+  }
+
+  private listSessionFiles(dirPath: string): string[] {
+    return this.readDirNames(dirPath)
+      .filter((fileName) => this.isSessionFileName(fileName))
+      .map((fileName) => path.join(dirPath, fileName));
+  }
+
+  private readDirNames(dirPath: string): string[] {
+    try {
+      return fs.readdirSync(dirPath);
     } catch {
       return [];
     }
   }
 
-  /** Called when a new subdirectory appears in a watched base dir. */
-  private onNewSubdir(workspaceDir: string): void {
-    if (!this.isDirectory(workspaceDir)) return;
-    const chatSessionsDir = path.join(workspaceDir, 'chatSessions');
-    if (!this.isDirectory(chatSessionsDir)) return;
-    this.trackChatDir(chatSessionsDir);
+  private isSessionFileName(fileName: string): boolean {
+    return fileName.endsWith('.jsonl') || fileName.endsWith('.json');
   }
 
-  /** Skip existing content so only appends after tracking begins are read. */
-  private fastForwardFile(filePath: string): void {
-    try {
-      const stat = fs.statSync(filePath);
-      this.sessionFileState.set(filePath, {
-        position: stat.size,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-      });
-    } catch { /* ignore */ }
+  private isChatSessionsDir(dirPath: string): boolean {
+    return path.basename(dirPath).toLowerCase().includes('chatsessions');
   }
 
   private isDirectory(dirPath: string): boolean {
     try {
-      return fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory();
+      return fs.statSync(dirPath).isDirectory();
     } catch {
       return false;
     }
   }
 
-  private watchFile(filePath: string): void {
-    if (this.fileWatchers.has(filePath)) return;
-    try {
-      const w = fs.watch(filePath, () => this.processFile(filePath));
-      this.fileWatchers.set(filePath, w);
-    } catch {
-      /* file may not exist yet */
-    }
-  }
-
-  private processFile(filePath: string): void {
-    try {
-      if (filePath.endsWith('.json')) {
-        this.processJsonFile(filePath);
-        return;
-      }
-
-      const stat = fs.statSync(filePath);
-      const state = this.sessionFileState.get(filePath);
-      const rewrote =
-        !!state
-        && (stat.size < state.position || (stat.mtimeMs !== state.mtimeMs && stat.size <= state.size));
-
-      if (rewrote) {
-        // Copilot occasionally rewrites session files. Treat rewrites as a reset
-        // so we can continue following the file without losing future writes.
-        this.resetFileState(filePath);
-        this.sessionFileState.set(filePath, {
-          position: 0,
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-        });
-      }
-
-      const currentState = this.sessionFileState.get(filePath);
-      const startPos = currentState?.position ?? 0;
-      if (stat.size <= startPos) {
-        if (currentState) {
-          currentState.size = stat.size;
-          currentState.mtimeMs = stat.mtimeMs;
-        } else {
-          this.sessionFileState.set(filePath, {
-            position: startPos,
-            size: stat.size,
-            mtimeMs: stat.mtimeMs,
-          });
-        }
-        return;
-      }
-
-      const fd = fs.openSync(filePath, 'r');
-      const buf = Buffer.alloc(stat.size - startPos);
-      const bytesRead = fs.readSync(fd, buf, 0, buf.length, startPos);
-      fs.closeSync(fd);
-
-      this.sessionFileState.set(filePath, {
-        position: startPos + bytesRead,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-      });
-
-      const chunk = buf.subarray(0, bytesRead).toString('utf-8');
-      for (const rawLine of chunk.split('\n')) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        this.parseLine(filePath, line);
-      }
-    } catch {
-      /* file may be mid-write */
-    }
-  }
-
-  /** Handle legacy .json session files (single JSON object with requests array). */
-  private processJsonFile(filePath: string): void {
-    try {
-      const stat = fs.statSync(filePath);
-      const previous = this.jsonFileState.get(filePath);
-      if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) return;
-      this.jsonFileState.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs });
-
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const session = JSON.parse(content);
-      if (!session || typeof session !== 'object') return;
-      this.extractFromSessionObject(filePath, session);
-    } catch { /* ignore malformed files */ }
-  }
-
-  private resetFileState(filePath: string): void {
-    this.requestMetaByFile.delete(filePath);
-    this.pendingCreditsByFile.delete(filePath);
-    this.sessionTitleByFile.delete(filePath);
-  }
-
-  /**
-   * Extract usage events from a full session object (used by both .json files
-   * and kind=0 snapshots in .jsonl files).
-   */
-  private extractFromSessionObject(filePath: string, session: Record<string, unknown>): void {
-    if (typeof session.customTitle === 'string') {
-      this.sessionTitleByFile.set(filePath, session.customTitle);
-    }
-
-    const requests = session.requests;
-    if (!Array.isArray(requests)) return;
-
-    for (const req of requests) {
-      if (!req || typeof req !== 'object') continue;
-      const obj = req as Record<string, unknown>;
-
-      const meta = this.extractMetaFromRequest(filePath, obj);
-      if (!meta.requestId) continue;
-
-      const credits = this.extractCreditsFromRequest(obj);
-      if (credits !== undefined) {
-        this.emitUsage(meta, credits);
-      }
-    }
-  }
-
-  private parseLine(filePath: string, line: string): void {
-    let obj: ChatSessionDelta;
-    try {
-      obj = JSON.parse(line) as ChatSessionDelta;
-    } catch {
-      return;
-    }
-
-    // kind=0: full session snapshot — the v field contains the entire session
-    if (obj.kind === 0 && obj.v && typeof obj.v === 'object' && !Array.isArray(obj.v)) {
-      this.extractFromSessionObject(filePath, obj.v as Record<string, unknown>);
-      return;
-    }
-
-    if (!Array.isArray(obj.k)) return;
-    const key = obj.k;
-    const kind = obj.kind;
-    const requestMeta = this.requestMetaByFile.get(filePath) ?? new Map<number, RequestMeta>();
-    this.requestMetaByFile.set(filePath, requestMeta);
-    const pendingCredits = this.pendingCreditsByFile.get(filePath) ?? new Map<number, number>();
-    this.pendingCreditsByFile.set(filePath, pendingCredits);
-
-    if (kind === 1 && key.length === 1 && key[0] === 'customTitle' && typeof obj.v === 'string') {
-      this.sessionTitleByFile.set(filePath, obj.v);
-      return;
-    }
-
-    // Seed request metadata from a requests array snapshot.
-    if (kind === 2 && key.length === 1 && key[0] === 'requests' && Array.isArray(obj.v)) {
-      const requests = obj.v as unknown[];
-      for (let i = 0; i < requests.length; i++) {
-        const current = requestMeta.get(i);
-        const parsed = this.extractMetaFromRequest(filePath, requests[i]);
-        const meta: RequestMeta = {
-          requestId: parsed.requestId ?? current?.requestId,
-          timestamp: parsed.timestamp ?? current?.timestamp,
-          model: parsed.model ?? current?.model,
-          context: parsed.context ?? current?.context,
-        };
-        requestMeta.set(i, meta);
-
-        const embeddedCredits = this.extractCreditsFromRequest(requests[i]);
-        if (embeddedCredits !== undefined && meta.requestId) {
-          this.emitUsage(meta, embeddedCredits);
-        }
-
-        const pending = pendingCredits.get(i);
-        if (pending !== undefined && meta.requestId) {
-          this.emitUsage(meta, pending);
-          pendingCredits.delete(i);
-        }
-      }
-      return;
-    }
-
-    // Handle updates on a specific request index.
-    if (key.length < 2 || key[0] !== 'requests' || typeof key[1] !== 'number') return;
-    const index = key[1];
-
-    if (kind === 1 && key.length === 3 && key[2] === 'copilotCredits' && typeof obj.v === 'number') {
-      const meta = requestMeta.get(index);
-      if (!meta?.requestId) {
-        const fallback = this.getSingleKnownMeta(requestMeta);
-        if (fallback) {
-          this.emitUsage(fallback, obj.v);
-          return;
-        }
-        pendingCredits.set(index, obj.v);
-        return;
-      }
-      this.emitUsage(meta, obj.v);
-      return;
-    }
-
-    // Capture request metadata when an entire request object is inserted at index.
-    if (kind === 2 && key.length === 2 && Array.isArray(obj.v) && obj.v.length > 0) {
-      const current = requestMeta.get(index);
-      const first = this.extractMetaFromRequest(filePath, obj.v[0]);
-      const meta: RequestMeta = {
-        requestId: first.requestId ?? current?.requestId,
-        timestamp: first.timestamp ?? current?.timestamp,
-        model: first.model ?? current?.model,
-        context: first.context ?? current?.context,
-      };
-      requestMeta.set(index, meta);
-
-      const embeddedCredits = this.extractCreditsFromRequest(obj.v[0]);
-      if (embeddedCredits !== undefined && meta.requestId) {
-        this.emitUsage(meta, embeddedCredits);
-      }
-
-      const pending = pendingCredits.get(index);
-      if (pending !== undefined && meta.requestId) {
-        this.emitUsage(meta, pending);
-        pendingCredits.delete(index);
-      }
-      return;
-    }
-
-    // Capture field-level deltas on individual request properties.
-    if (kind === 1 && key.length >= 3) {
-      const field = key[2];
-
-      if (field === 'requestId' && key.length === 3 && typeof obj.v === 'string') {
-        const current = requestMeta.get(index) ?? {};
-        const meta: RequestMeta = { ...current, requestId: obj.v };
-        requestMeta.set(index, meta);
-
-        const pending = pendingCredits.get(index);
-        if (pending !== undefined) {
-          this.emitUsage(meta, pending);
-          pendingCredits.delete(index);
-        }
-        return;
-      }
-
-      if (field === 'timestamp' && key.length === 3 && typeof obj.v === 'number') {
-        const current = requestMeta.get(index) ?? {};
-        requestMeta.set(index, { ...current, timestamp: obj.v });
-        return;
-      }
-
-      if (key.length === 3 && MODEL_FIELDS.has(field as string)) {
-        const model = this.extractModelValue(obj.v);
-        if (model) {
-          const current = requestMeta.get(index) ?? {};
-          requestMeta.set(index, { ...current, model });
-        }
-        return;
-      }
-
-      if (key.length === 3 && (field === 'result' || field === 'response') && typeof obj.v === 'object' && obj.v !== null) {
-        const nested = obj.v as Record<string, unknown>;
-        const model = this.extractModelValue(nested.model) ?? this.extractModelValue(nested.modelName);
-        if (model) {
-          const current = requestMeta.get(index) ?? {};
-          if (!current.model) {
-            requestMeta.set(index, { ...current, model });
-          }
-        }
-        const credits = typeof nested.copilotCredits === 'number' ? nested.copilotCredits : undefined;
-        if (credits !== undefined && credits > 0) {
-          const meta = requestMeta.get(index);
-          if (meta?.requestId) {
-            this.emitUsage(meta, credits);
-          } else {
-            pendingCredits.set(index, credits);
-          }
-        }
-        return;
-      }
-
-      if (key.length === 4 && (field === 'result' || field === 'response')) {
-        const subField = key[3];
-        if (MODEL_FIELDS.has(subField as string) || subField === 'modelName') {
-          const model = this.extractModelValue(obj.v);
-          if (model) {
-            const current = requestMeta.get(index) ?? {};
-            if (!current.model) {
-              requestMeta.set(index, { ...current, model });
-            }
-          }
-        }
-        if (subField === 'copilotCredits' && typeof obj.v === 'number' && obj.v > 0) {
-          const meta = requestMeta.get(index);
-          if (meta?.requestId) {
-            this.emitUsage(meta, obj.v);
-          } else {
-            pendingCredits.set(index, obj.v);
-          }
-        }
-        return;
-      }
-
-      if (field === 'message' && key.length === 3 && typeof obj.v === 'object' && obj.v !== null) {
-        const current = requestMeta.get(index) ?? {};
-        const messageText = (obj.v as { text?: unknown }).text;
-        if (typeof messageText !== 'string') return;
-        const context = this.buildContext(filePath, messageText);
-        if (!context) return;
-        requestMeta.set(index, { ...current, context });
-      }
-    }
-  }
-
-  private extractCreditsFromRequest(req: unknown): number | undefined {
-    if (!req || typeof req !== 'object') return undefined;
-    const obj = req as Record<string, unknown>;
-
-    if (typeof obj.copilotCredits === 'number' && obj.copilotCredits > 0) {
-      return obj.copilotCredits;
-    }
-
-    for (const key of ['result', 'response']) {
-      const nested = obj[key];
-      if (nested && typeof nested === 'object') {
-        const n = nested as Record<string, unknown>;
-        if (typeof n.copilotCredits === 'number' && n.copilotCredits > 0) {
-          return n.copilotCredits;
-        }
-      }
-    }
-
-    return undefined;
-  }
-
-  private extractModelValue(v: unknown): string | undefined {
-    if (typeof v === 'string' && v.length > 0) return v;
-    if (v && typeof v === 'object') {
-      const obj = v as Record<string, unknown>;
-      for (const key of ['id', 'name', 'modelId', 'slug']) {
-        if (typeof obj[key] === 'string' && (obj[key] as string).length > 0) {
-          return obj[key] as string;
-        }
-      }
+  private firstString(record: Record<string, unknown>, fields: string[]): string | undefined {
+    for (const field of fields) {
+      if (typeof record[field] !== 'string') continue;
+      const value = this.cleanText(record[field]);
+      if (value) return value;
     }
     return undefined;
   }
 
-  private emitUsage(meta: RequestMeta, credits: number): void {
-    if (!meta.requestId) return;
-    const ts =
-      typeof meta.timestamp === 'number' ? new Date(meta.timestamp).toISOString() : new Date().toISOString();
-    this.emit('usage', {
-      sourceId: meta.requestId,
-      timestamp: ts,
-      credits,
-      model: meta.model,
-      context: meta.context,
-    } as UsageEvent);
+  private cleanText(value: unknown, maxLength = 200): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const cleaned = value.replace(/\s+/g, ' ').trim();
+    return cleaned ? cleaned.slice(0, maxLength) : undefined;
   }
 
-  private extractMetaFromRequest(filePath: string, req: unknown): RequestMeta {
-    if (!req || typeof req !== 'object') return {};
-    const obj = req as Record<string, unknown>;
-    const messageText =
-      typeof (obj.message as { text?: unknown })?.text === 'string'
-        ? ((obj.message as { text: string }).text)
-        : undefined;
-
-    let model = this.extractModelValue(obj.model)
-      ?? this.extractModelValue(obj.modelSlug)
-      ?? this.extractModelValue(obj.chatModelId)
-      ?? this.extractModelValue(obj.modelId)
-      ?? this.extractModelValue(obj.selectedModelId);
-
-    if (!model && obj.result && typeof obj.result === 'object') {
-      const result = obj.result as Record<string, unknown>;
-      model = this.extractModelValue(result.model) ?? this.extractModelValue(result.modelName);
-    }
-    if (!model && obj.response && typeof obj.response === 'object') {
-      const response = obj.response as Record<string, unknown>;
-      model = this.extractModelValue(response.model) ?? this.extractModelValue(response.modelName);
-    }
-
-    return {
-      requestId: typeof obj.requestId === 'string' ? obj.requestId : undefined,
-      timestamp: typeof obj.timestamp === 'number' ? obj.timestamp : undefined,
-      model,
-      context: this.buildContext(filePath, messageText),
-    };
-  }
-
-  private buildContext(filePath: string, messageText?: string): string | undefined {
-    const title = this.sessionTitleByFile.get(filePath);
-    const text = title?.trim() ? title : messageText;
-    if (!text?.trim()) return undefined;
-    return text.replace(/\s+/g, ' ').trim().slice(0, 100);
-  }
-
-  private getSingleKnownMeta(requestMeta: Map<number, RequestMeta>): RequestMeta | undefined {
-    const ids = new Map<string, RequestMeta>();
-    for (const meta of requestMeta.values()) {
-      if (!meta.requestId) continue;
-      if (!ids.has(meta.requestId)) {
-        ids.set(meta.requestId, meta);
-      }
-    }
-    if (ids.size !== 1) return undefined;
-    return ids.values().next().value as RequestMeta;
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
   }
 }

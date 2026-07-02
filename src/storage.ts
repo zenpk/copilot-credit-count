@@ -15,171 +15,58 @@ export interface Summary {
   totalCredits: number;
 }
 
-interface SeenEntry {
+type NewCreditEntry = Omit<CreditEntry, 'id'>;
+
+interface IndexedEntry {
   month: string;
-  credits: number;
-  model?: string;
-  context?: string;
+  entry: CreditEntry;
 }
 
+const MONTH_FILE_RE = /^credits-(\d{4}-\d{2})\.json$/;
+
 export class CreditsStorage {
-  private readonly storageDir: string;
-  private readonly seenIds = new Map<string, SeenEntry>();
+  private readonly latestBySourceId = new Map<string, IndexedEntry>();
 
-  constructor(storageDir: string) {
+  constructor(private readonly storageDir: string) {
     fs.mkdirSync(storageDir, { recursive: true });
-    this.storageDir = storageDir;
-    this.loadSeenIds();
+    this.rebuildIndex();
   }
 
-  private loadSeenIds(): void {
-    for (const file of this.listMonthFiles()) {
-      const month = this.monthFromFile(file);
-      for (const e of this.readFile(file)) {
-        this.seenIds.set(e.sourceId, {
-          month,
-          credits: Number(e.credits) || 0,
-          model: e.model,
-          context: e.context,
-        });
-      }
-    }
-  }
+  add(input: NewCreditEntry): CreditEntry | undefined {
+    const normalized = this.normalize(input);
+    if (!normalized) return undefined;
 
-  private listMonthFiles(): string[] {
-    try {
-      return fs
-        .readdirSync(this.storageDir)
-        .filter((f) => /^credits-\d{4}-\d{2}\.json$/.test(f))
-        .map((f) => path.join(this.storageDir, f))
-        .sort();
-    } catch {
-      return [];
-    }
-  }
+    const known = this.latestBySourceId.get(normalized.sourceId);
+    if (known && !this.isNewInformation(known.entry, normalized)) return undefined;
 
-  private monthKey(ts: string): string {
-    const d = new Date(ts);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-  }
-
-  private fileForMonth(month: string): string {
-    return path.join(this.storageDir, `credits-${month}.json`);
-  }
-
-  private monthFromFile(filePath: string): string {
-    return path.basename(filePath).replace(/^credits-/, '').replace(/\.json$/, '');
-  }
-
-  private readFile(filePath: string): CreditEntry[] {
-    if (!fs.existsSync(filePath)) return [];
-    try {
-      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter((entry): entry is CreditEntry => this.isCreditEntry(entry));
-    } catch {
-      return [];
-    }
-  }
-
-  private isCreditEntry(entry: unknown): entry is CreditEntry {
-    if (!entry || typeof entry !== 'object') return false;
-    const obj = entry as Record<string, unknown>;
-    return (
-      typeof obj.id === 'string'
-      && typeof obj.sourceId === 'string'
-      && typeof obj.timestamp === 'string'
-      && typeof obj.credits === 'number'
-    );
-  }
-
-  private writeFile(filePath: string, entries: CreditEntry[]): void {
-    fs.writeFileSync(filePath, JSON.stringify(entries, null, 2), 'utf-8');
-  }
-
-  private createId(): string {
-    return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  }
-
-  private shouldAppend(existing: SeenEntry, entry: Omit<CreditEntry, 'id'>, credits: number): boolean {
-    if (credits > existing.credits) return true;
-    if (credits < existing.credits) return false;
-
-    return Boolean(
-      (entry.model && entry.model !== existing.model)
-      || (entry.context && entry.context !== existing.context),
-    );
-  }
-
-  private mergeEntry(existing: SeenEntry | undefined, entry: Omit<CreditEntry, 'id'>, credits: number): Omit<CreditEntry, 'id'> {
-    return {
-      sourceId: entry.sourceId,
-      timestamp: entry.timestamp,
-      credits,
-      model: entry.model ?? existing?.model,
-      context: entry.context ?? existing?.context,
-    };
-  }
-
-  private sortEntries(entries: CreditEntry[]): CreditEntry[] {
-    return [...entries].sort((a, b) => {
-      const ta = new Date(a.timestamp).getTime();
-      const tb = new Date(b.timestamp).getTime();
-      return ta !== tb ? ta - tb : a.id.localeCompare(b.id);
-    });
-  }
-
-  private collapseEntries(entries: CreditEntry[]): CreditEntry[] {
-    const latestBySourceId = new Map<string, CreditEntry>();
-    for (const entry of entries) {
-      if (!entry.sourceId) continue;
-      latestBySourceId.set(entry.sourceId, entry);
-    }
-    return this.sortEntries([...latestBySourceId.values()]);
-  }
-
-  add(entry: Omit<CreditEntry, 'id'>): CreditEntry | undefined {
-    const credits = Number(entry.credits);
-    if (!Number.isFinite(credits) || credits <= 0) return undefined;
-
-    const existing = this.seenIds.get(entry.sourceId);
-    if (existing && !this.shouldAppend(existing, entry, credits)) return undefined;
-
-    // Keep revisions in the original month so the history stays append-only.
-    const month = existing?.month ?? this.monthKey(entry.timestamp);
-    const filePath = this.fileForMonth(month);
-    const entries = this.readFile(filePath);
-    const newEntry: CreditEntry = {
+    const entry: CreditEntry = {
       id: this.createId(),
-      ...this.mergeEntry(existing, entry, credits),
+      ...this.mergeWithKnownEntry(normalized, known?.entry),
     };
-    entries.push(newEntry);
-    this.writeFile(filePath, entries);
-    this.seenIds.set(entry.sourceId, {
-      month,
-      credits,
-      model: newEntry.model,
-      context: newEntry.context,
-    });
-    return newEntry;
+    const month = known?.month ?? this.monthKey(entry.timestamp);
+
+    this.appendToMonthFile(month, entry);
+    this.latestBySourceId.set(entry.sourceId, { month, entry });
+
+    return entry;
   }
 
   getByMonth(year: number, month: number): CreditEntry[] {
-    const m = `${year}-${String(month).padStart(2, '0')}`;
-    return this.collapseEntries(this.readFile(this.fileForMonth(m)));
+    const monthKey = `${year}-${String(month).padStart(2, '0')}`;
+    return this.currentEntries(this.readMonthFile(this.monthFilePath(monthKey)));
   }
 
   getAll(): CreditEntry[] {
-    const all: CreditEntry[] = [];
-    for (const file of this.listMonthFiles()) {
-      all.push(...this.readFile(file));
+    const entries: CreditEntry[] = [];
+    for (const filePath of this.listMonthFiles()) {
+      entries.push(...this.readMonthFile(filePath));
     }
-    return this.collapseEntries(all);
+    return this.currentEntries(entries);
   }
 
   getAvailableMonths(): string[] {
     return this.listMonthFiles()
-      .map((f) => path.basename(f).replace(/^credits-/, '').replace(/\.json$/, ''))
+      .map((filePath) => this.monthFromFilePath(filePath))
       .sort()
       .reverse();
   }
@@ -193,20 +80,207 @@ export class CreditsStorage {
   }
 
   getMonthFilePath(month: string): string {
-    const filePath = this.fileForMonth(month);
+    const filePath = this.monthFilePath(month);
     if (!fs.existsSync(filePath)) {
-      this.writeFile(filePath, []);
+      fs.writeFileSync(filePath, '[]\n', 'utf8');
     }
     return filePath;
   }
 
   summarize(entries: CreditEntry[]): Summary {
     return entries.reduce<Summary>(
-      (acc, e) => ({
-        count: acc.count + 1,
-        totalCredits: acc.totalCredits + (Number(e.credits) || 0),
+      (summary, entry) => ({
+        count: summary.count + 1,
+        totalCredits: summary.totalCredits + entry.credits,
       }),
       { count: 0, totalCredits: 0 },
     );
+  }
+
+  private rebuildIndex(): void {
+    this.latestBySourceId.clear();
+
+    for (const filePath of this.listMonthFiles()) {
+      const month = this.monthFromFilePath(filePath);
+      for (const entry of this.readMonthFile(filePath)) {
+        this.latestBySourceId.set(entry.sourceId, { month, entry });
+      }
+    }
+  }
+
+  private normalize(input: NewCreditEntry): NewCreditEntry | undefined {
+    const credits = Number(input.credits);
+    if (!input.sourceId || !Number.isFinite(credits) || credits <= 0) return undefined;
+
+    const timestamp = this.validTimestamp(input.timestamp) ? input.timestamp : new Date().toISOString();
+
+    return {
+      sourceId: input.sourceId,
+      timestamp,
+      credits,
+      model: this.cleanOptionalText(input.model),
+      context: this.cleanOptionalText(input.context),
+    };
+  }
+
+  private validTimestamp(timestamp: string): boolean {
+    return typeof timestamp === 'string' && Number.isFinite(new Date(timestamp).getTime());
+  }
+
+  private cleanOptionalText(value: string | undefined): string | undefined {
+    const cleaned = value?.trim();
+    return cleaned ? cleaned : undefined;
+  }
+
+  private isNewInformation(known: CreditEntry, next: NewCreditEntry): boolean {
+    if (next.credits > known.credits) return true;
+    if (next.credits < known.credits) return false;
+
+    return Boolean(
+      (next.model && next.model !== known.model)
+      || (!known.context && next.context),
+    );
+  }
+
+  private mergeWithKnownEntry(next: NewCreditEntry, known: CreditEntry | undefined): NewCreditEntry {
+    return {
+      sourceId: next.sourceId,
+      timestamp: next.timestamp,
+      credits: next.credits,
+      model: next.model ?? known?.model,
+      context: next.context ?? known?.context,
+    };
+  }
+
+  private listMonthFiles(): string[] {
+    try {
+      return fs
+        .readdirSync(this.storageDir)
+        .filter((fileName) => MONTH_FILE_RE.test(fileName))
+        .map((fileName) => path.join(this.storageDir, fileName))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  private readMonthFile(filePath: string): CreditEntry[] {
+    if (!fs.existsSync(filePath)) return [];
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((value) => {
+        const entry = this.toCreditEntry(value);
+        return entry ? [entry] : [];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private toCreditEntry(value: unknown): CreditEntry | undefined {
+    if (!value || typeof value !== 'object') return undefined;
+    const record = value as Record<string, unknown>;
+    const credits = Number(record.credits);
+
+    if (
+      typeof record.id !== 'string'
+      || typeof record.sourceId !== 'string'
+      || typeof record.timestamp !== 'string'
+      || !Number.isFinite(credits)
+      || credits <= 0
+    ) {
+      return undefined;
+    }
+
+    return {
+      id: record.id,
+      sourceId: record.sourceId,
+      timestamp: record.timestamp,
+      credits,
+      model: typeof record.model === 'string' ? record.model : undefined,
+      context: typeof record.context === 'string' ? record.context : undefined,
+    };
+  }
+
+  private currentEntries(entries: CreditEntry[]): CreditEntry[] {
+    const latest = new Map<string, CreditEntry>();
+    for (const entry of entries) {
+      latest.set(entry.sourceId, entry);
+    }
+    return this.sortEntries([...latest.values()]);
+  }
+
+  private sortEntries(entries: CreditEntry[]): CreditEntry[] {
+    return [...entries].sort((a, b) => {
+      const timestampDelta = new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+      return timestampDelta || a.id.localeCompare(b.id);
+    });
+  }
+
+  private appendToMonthFile(month: string, entry: CreditEntry): void {
+    const filePath = this.monthFilePath(month);
+    const entryJson = this.indent(JSON.stringify(entry, null, 2));
+
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
+      fs.writeFileSync(filePath, `[\n${entryJson}\n]\n`, 'utf8');
+      return;
+    }
+
+    const content = fs.readFileSync(filePath, 'utf8');
+    const closeIndex = this.findArrayCloseIndex(content);
+    if (closeIndex < 0) {
+      throw new Error(`Cannot append credit entry because ${filePath} is not a JSON array.`);
+    }
+
+    const hasEntries = this.hasArrayEntries(content.slice(0, closeIndex));
+    const addition = hasEntries ? `,\n${entryJson}\n]` : `\n${entryJson}\n]`;
+    const byteOffset = Buffer.byteLength(content.slice(0, closeIndex), 'utf8');
+    const fd = fs.openSync(filePath, 'r+');
+
+    try {
+      fs.writeSync(fd, addition, byteOffset, 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  private findArrayCloseIndex(content: string): number {
+    for (let i = content.length - 1; i >= 0; i--) {
+      const char = content[i];
+      if (/\s/.test(char)) continue;
+      return char === ']' ? i : -1;
+    }
+    return -1;
+  }
+
+  private hasArrayEntries(beforeClose: string): boolean {
+    return beforeClose.replace(/^\s*\[/, '').trim().length > 0;
+  }
+
+  private indent(json: string): string {
+    return json
+      .split('\n')
+      .map((line) => `  ${line}`)
+      .join('\n');
+  }
+
+  private monthFilePath(month: string): string {
+    return path.join(this.storageDir, `credits-${month}.json`);
+  }
+
+  private monthFromFilePath(filePath: string): string {
+    return path.basename(filePath).replace(/^credits-/, '').replace(/\.json$/, '');
+  }
+
+  private monthKey(timestamp: string): string {
+    const date = new Date(timestamp);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  private createId(): string {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
 }
